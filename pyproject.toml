@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boswell"
+version = "0.1.0"
+description = "Universal repo auditor — turns any codebase into a legible handoff doc"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.30.0",
+    "click>=8.1",
+    "rich>=13.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+    "cryptography>=42.0.0",
+    "psycopg2-binary>=2.9",
+]
+
+[project.scripts]
+boswell = "boswell.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["boswell*"]
