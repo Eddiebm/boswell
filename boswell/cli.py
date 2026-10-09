@@ -13,6 +13,7 @@ from .analyzer import analyze_repo
 from .cost import estimate_cost
 from .fixer import offer_fixes
 from .scanner import scan_repo
+from .strix_run import StrixRunError, run_strix
 from .writer import (
     extract_fate,
     extract_top_risk,
@@ -189,6 +190,25 @@ def run(repo: str, context: bool, skip_confirm: bool):
     api_key = _get_api_key()
     repo_path = Path(repo).resolve()
     _run_single_repo(repo_path, api_key, skip_confirm=skip_confirm, prompt_context=context)
+
+
+@main.command(name="strix")
+@click.argument("repo")
+@click.option(
+    "--scan-mode",
+    type=click.Choice(["quick", "standard", "deep"]),
+    default="quick",
+    show_default=True,
+    help="How deep Strix should test.",
+)
+def strix_cmd(repo: str, scan_mode: str) -> None:
+    """Run Strix against a local repository you own."""
+    try:
+        code = run_strix(repo, scan_mode)
+    except StrixRunError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        sys.exit(1)
+    sys.exit(code)
 
 
 @main.command()
