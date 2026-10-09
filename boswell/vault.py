@@ -24,6 +24,19 @@ _session_fernet: Fernet | None = None
 
 def _ensure_dir():
     VAULT_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(VAULT_DIR, 0o700)
+
+
+def _restrict_file(path: Path) -> None:
+    if path.exists():
+        os.chmod(path, 0o600)
+
+
+def tighten_vault_files() -> None:
+    """Keep the vault and its salt readable only by this user."""
+    _ensure_dir()
+    _restrict_file(VAULT_PATH)
+    _restrict_file(SALT_PATH)
 
 
 def _derive_key(password: str, salt: bytes) -> Fernet:
@@ -46,6 +59,7 @@ def create_vault(password: str) -> None:
     _ensure_dir()
     salt = os.urandom(16)
     SALT_PATH.write_bytes(salt)
+    _restrict_file(SALT_PATH)
     f = _derive_key(password, salt)
     _save({}, f)
     global _session_fernet
@@ -90,6 +104,7 @@ def _save(data: dict, f: Fernet | None = None) -> None:
         raise RuntimeError("Vault is locked")
     _ensure_dir()
     VAULT_PATH.write_bytes(fernet.encrypt(json.dumps(data).encode()))
+    _restrict_file(VAULT_PATH)
 
 
 def store_secret(repo: str, key: str, value: str) -> None:
@@ -141,6 +156,26 @@ def get_secret(repo: str, key: str) -> str | None:
     if not is_unlocked():
         return None
     data = _load()
+    entry = data.get(repo, {}).get(key)
+    return entry["value"] if entry else None
+
+
+def open_vault(password: str) -> dict | None:
+    """Decrypt the vault with a password. Does not leave it unlocked."""
+    if not password or not VAULT_PATH.exists() or not SALT_PATH.exists():
+        return None
+    fernet = _derive_key(password, SALT_PATH.read_bytes())
+    try:
+        return _load(fernet)
+    except Exception:
+        return None
+
+
+def read_secret(repo: str, key: str, password: str) -> str | None:
+    """Return one secret after checking the master password again."""
+    data = open_vault(password)
+    if data is None:
+        return None
     entry = data.get(repo, {}).get(key)
     return entry["value"] if entry else None
 

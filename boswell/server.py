@@ -10,15 +10,46 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import vault as v
+from .safety import (
+    api_token,
+    assert_public_http_url,
+    bearer_ok,
+    clear_unlock_failures,
+    contained_path,
+    host_allowed,
+    record_unlock_failure,
+    unlock_blocked,
+)
 
 app = FastAPI(title="Boswell", docs_url=None, redoc_url=None)
+
+
+class _LocalGuard(BaseHTTPMiddleware):
+    """Accept only localhost, and require the local API token on /api routes."""
+
+    async def dispatch(self, request, call_next):
+        if not host_allowed(request.headers.get("host", "")):
+            return JSONResponse({"detail": "This server only accepts localhost."}, status_code=403)
+        path = request.url.path
+        if path == "/api" or path.startswith("/api/"):
+            if not bearer_ok(request.headers.get("authorization")):
+                return JSONResponse({"detail": "Missing or invalid API token."}, status_code=401)
+        return await call_next(request)
+
+
+app.add_middleware(_LocalGuard)
 
 
 @app.on_event("startup")
 def _startup_init_db():
     """Ensure Neon schema (including boswell_repo_meta) is up to date on server start."""
+    try:
+        v.tighten_vault_files()
+    except Exception:
+        pass
     try:
         from . import db as _db
         db_url = _db.get_url()
@@ -639,16 +670,13 @@ def api_fix_selected(req: FixSelectedRequest):
         # Apply patches
         patched_files = []
         for rel_path, content in patches:
-            full_path = Path(repo_path) / rel_path.lstrip("/")
-            # Safety: must be inside the repo
-            try:
-                full_path.resolve().relative_to(Path(repo_path).resolve())
-            except ValueError:
-                errors.append(f"{repo_name}: path traversal rejected — {rel_path}")
+            full_path = contained_path(Path(repo_path), rel_path)
+            if full_path is None:
+                errors.append(f"{repo_name}: path escapes repo — {rel_path}")
                 continue
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content.strip("\n"))
-            patched_files.append(rel_path)
+            patched_files.append(str(full_path.relative_to(Path(repo_path).resolve())))
 
         if not patched_files:
             errors.append(f"{repo_name}: no files written")
@@ -863,6 +891,11 @@ async def api_set_deployed_url(name: str, request: Request):
     """Set the deployed_url for a repo in both local metadata.json and Neon."""
     body = await request.json()
     url_value = body.get("url", "").strip()
+    if url_value:
+        try:
+            assert_public_http_url(url_value)
+        except ValueError:
+            raise HTTPException(400, "Deployed URL must be a public http or https address")
     repos = _find_boswell_repos(_repos_root)
     repo = next((r for r in repos if r["name"] == name), None)
     if not repo:
@@ -908,11 +941,15 @@ async def vault_create(request: Request):
 
 @app.post("/api/vault/unlock")
 async def vault_unlock(request: Request):
+    if unlock_blocked():
+        raise HTTPException(429, "Too many unlock attempts. Wait and try again.")
     body = await request.json()
     password = body.get("password", "")
     ok = v.unlock_vault(password)
     if not ok:
+        record_unlock_failure()
         raise HTTPException(401, "Wrong password")
+    clear_unlock_failures()
     return {"ok": True}
 
 
@@ -929,14 +966,22 @@ def vault_secrets():
     return v.all_secrets_masked()
 
 
-@app.get("/api/vault/secret/{repo}/{key}")
-def vault_get_secret(repo: str, key: str):
-    if not v.is_unlocked():
-        raise HTTPException(403, "Vault is locked")
-    val = v.get_secret(repo, key)
-    if val is None:
+@app.post("/api/vault/secret/{repo}/{key}")
+async def vault_get_secret(repo: str, key: str, request: Request):
+    """Return one secret only after the master password is checked again."""
+    if unlock_blocked():
+        raise HTTPException(429, "Too many unlock attempts. Wait and try again.")
+    body = await request.json()
+    password = body.get("password", "")
+    data = v.open_vault(password)
+    if data is None:
+        record_unlock_failure()
+        raise HTTPException(401, "Wrong password")
+    clear_unlock_failures()
+    entry = data.get(repo, {}).get(key)
+    if not entry:
         raise HTTPException(404, "Secret not found")
-    return {"value": val}
+    return {"value": entry["value"]}
 
 
 @app.post("/api/vault/ingest/{repo}")
@@ -1568,7 +1613,7 @@ def portfolio_assess_cached():
 
 
 @app.get("/api/repo/{name}/ship-check")
-async def repo_ship_check(name: str, skip_build: bool = True):
+async def repo_ship_check(name: str):
     """Run Ship Readiness checks — live ping, deployment health, env vars, auth, security."""
     repos = _find_boswell_repos(_repos_root)
     repo = next((r for r in repos if r["name"] == name), None)
@@ -1579,7 +1624,7 @@ async def repo_ship_check(name: str, skip_build: bool = True):
     platform, project_id = _detect_platform(path)
 
     from .ship_check import run_ship_checks
-    checks = run_ship_checks(path, platform=platform, project_id=project_id, skip_build=skip_build)
+    checks = run_ship_checks(path, platform=platform, project_id=project_id)
 
     passed = sum(1 for c in checks if c["status"] == "pass")
     failed = sum(1 for c in checks if c["status"] == "fail")
@@ -2178,6 +2223,17 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
+const BOSWELL_TOKEN = "__BOSWELL_TOKEN__";
+const _boswellFetch = window.fetch.bind(window);
+window.fetch = function (input, init) {
+  const next = init ? Object.assign({}, init) : {};
+  const headers = new Headers(next.headers || {});
+  if (!headers.has("Authorization")) {
+    headers.set("Authorization", "Bearer " + BOSWELL_TOKEN);
+  }
+  next.headers = headers;
+  return _boswellFetch(input, next);
+};
 const BOSWELL_BASE = window.location.pathname.replace(/\/[^/]*$/, '').replace(/\/$/, '') || '';
 let repos = [];
 let currentRepo = null;
@@ -3081,8 +3137,14 @@ async function lockVault() {
   vaultUnlocked = false; updateVaultBadge(); renderVaultPage();
 }
 async function revealSecret(repo, key) {
-  const res = await fetch(`/api/vault/secret/${repo}/${key}`);
-  if (!res.ok) return;
+  const password = window.prompt("Vault password to reveal this secret");
+  if (!password) return;
+  const res = await fetch(`/api/vault/secret/${repo}/${key}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({password}),
+  });
+  if (!res.ok) { alert("Wrong vault password"); return; }
   const data = await res.json();
   const el = document.getElementById(`sv-${repo}-${key}`);
   if (el) { el.textContent = data.value; el.classList.add('revealed'); }
@@ -3726,4 +3788,4 @@ setInterval(pollIfRunning, 15000);
 def shell(path: str = ""):
     if path.startswith("api/"):
         raise HTTPException(404)
-    return HTML
+    return HTML.replace("__BOSWELL_TOKEN__", api_token(), 1)

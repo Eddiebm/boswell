@@ -1,13 +1,12 @@
 """Offer to apply fixes for identified leak findings after each scan."""
 
-import subprocess
 from pathlib import Path
 
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.table import Table
 
-from .secret_check import LeakFinding
+from .secret_check import LeakFinding, apply_auto_fix
 
 # These categories carry shell commands that can be applied safely.
 # hardcoded-secret requires manual code edits — we show location + instructions.
@@ -33,19 +32,6 @@ def display_findings(findings: list[LeakFinding], console: Console) -> None:
 
     console.print()
     console.print(table)
-
-
-def _run_shell(cmd: str, cwd: Path) -> tuple[bool, str]:
-    try:
-        r = subprocess.run(
-            cmd, shell=True, cwd=cwd,
-            capture_output=True, text=True, timeout=60, errors="replace",
-        )
-        ok = r.returncode == 0
-        out = (r.stdout.strip() or r.stderr.strip())
-        return ok, out
-    except Exception as e:
-        return False, str(e)
 
 
 def offer_fixes(
@@ -80,7 +66,7 @@ def offer_fixes(
             console.print(f"  [dim]Command: {f.fix}[/dim]")
 
             if Confirm.ask("  Apply this fix now?", default=True):
-                ok, out = _run_shell(f.fix, repo_path)
+                ok, out = apply_auto_fix(f, repo_path)
                 if ok:
                     console.print(
                         f"  [green]✓ Applied.[/green]" + (f" ({out})" if out else "")

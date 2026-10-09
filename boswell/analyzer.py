@@ -222,7 +222,8 @@ def analyze_repo(
         "secret_warnings": secret_warnings,
         "leak_findings": [
             {"severity": f.severity, "category": f.category,
-             "description": f.description, "location": f.location, "fix": f.fix}
+             "description": f.description, "location": f.location, "fix": f.fix,
+             "action": f.action}
             for f in leak_findings
         ],
     }

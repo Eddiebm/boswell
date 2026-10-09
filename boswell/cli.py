@@ -148,6 +148,7 @@ def _run_single_repo(
             description=f["description"],
             location=f.get("location", ""),
             fix=f.get("fix", ""),
+            action=f.get("action"),
         )
         for f in raw_findings
     ]
@@ -227,6 +228,7 @@ def serve(root: str, port: int, open: bool):
     url = f"http://localhost:{port}"
     console.print(f"[bold cyan]Boswell[/bold cyan] UI → [underline]{url}[/underline]")
     console.print(f"[dim]Scanning repos under: {root_path}[/dim]")
+    console.print("[dim]The page only answers to localhost. Its API token stays in ~/.boswell/api.token.[/dim]")
 
     if open:
         import threading

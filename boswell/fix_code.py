@@ -10,6 +10,8 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from .safety import contained_path
+
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_FLASH = "google/gemini-2.5-flash"
 
@@ -323,7 +325,11 @@ def fix_repo(
 
     for finding in actionable:
         rel_path = finding["file_path"]
-        full_path = repo_path / rel_path
+        full_path = contained_path(repo_path, rel_path) if isinstance(rel_path, str) else None
+        if full_path is None:
+            log(f"  [yellow]Skip (path escapes repo):[/yellow] {rel_path}")
+            skipped += 1
+            continue
 
         if not full_path.exists():
             log(f"  [yellow]Skip (not found):[/yellow] {rel_path}")

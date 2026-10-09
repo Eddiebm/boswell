@@ -19,6 +19,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .safety import contained_path
+
 # (label, regex matching the secret token shape — not a variable name)
 SECRET_PATTERNS = [
     ("Anthropic API key",      re.compile(r"sk-ant-[a-zA-Z0-9\-_]{20,}")),
@@ -62,7 +64,8 @@ class LeakFinding:
     category: str       # "tracked-env-file" | "hardcoded-secret" | "history-leak" | "gitignore-gap"
     description: str    # human-readable, no secret value
     location: str       # file path, commit ref, or "no .gitignore"
-    fix: str            # exact remediation command or instruction
+    fix: str            # what the operator should do, shown in the UI
+    action: dict | None = None  # structured fix; never a shell string
 
 
 def _run(cmd: list[str], cwd: Path, timeout: int = 120) -> str:
@@ -254,7 +257,8 @@ def scan_working_tree(repo_path: Path) -> list[LeakFinding]:
                 category="tracked-env-file",
                 description=f".env file is tracked by git: {rel_path}",
                 location=rel_path,
-                fix=f'echo "{rel_path}" >> .gitignore && git rm --cached {rel_path} && git commit -m "stop tracking {rel_path}"',
+                fix=f"Stop tracking {rel_path} and add it to .gitignore.",
+                action={"type": "untrack", "path": rel_path},
             ))
             continue  # no need to also scan its contents — just remove it
 
@@ -293,7 +297,12 @@ def scan_gitignore(repo_path: Path) -> list[LeakFinding]:
             category="gitignore-gap",
             description="No .gitignore file found — .env files are unprotected",
             location=".gitignore (missing)",
-            fix='echo ".env\n.env.*\n!.env.example\n!.env.sample" >> .gitignore && git add .gitignore',
+            fix="Add .env rules to a new .gitignore.",
+            action={
+                "type": "gitignore_lines",
+                "lines": [".env", ".env.*", "!.env.example", "!.env.sample"],
+                "stage": True,
+            },
         ))
         return findings
 
@@ -310,7 +319,12 @@ def scan_gitignore(repo_path: Path) -> list[LeakFinding]:
             category="gitignore-gap",
             description=".gitignore exists but does not exclude .env files",
             location=".gitignore",
-            fix='echo "\\n.env\\n.env.*\\n!.env.example\\n!.env.sample" >> .gitignore',
+            fix="Add .env rules to .gitignore.",
+            action={
+                "type": "gitignore_lines",
+                "lines": [".env", ".env.*", "!.env.example", "!.env.sample"],
+                "stage": False,
+            },
         ))
 
     # Collect all .gitignore content across the repo (root + subdirs, skip worktrees)
@@ -338,7 +352,8 @@ def scan_gitignore(repo_path: Path) -> list[LeakFinding]:
                 category="gitignore-gap",
                 description=f"{dir_name}/ files are tracked by git and not excluded — {reason} (e.g. {example})",
                 location=f"{dir_name}/ (e.g. {example})",
-                fix=f'echo "\\n{dir_name}/" >> .gitignore && git rm -r --cached $(git ls-files "*{dir_name}*") && git commit -m "untrack {dir_name}/ artifacts"',
+                fix=f"Stop tracking {dir_name}/ and add it to .gitignore.",
+                action={"type": "untrack_dir", "dir": dir_name},
             ))
 
     # Check for any .env* files on disk that ARE tracked despite .gitignore
@@ -353,10 +368,112 @@ def scan_gitignore(repo_path: Path) -> list[LeakFinding]:
                     category="tracked-env-file",
                     description=f"{item.name} is in .gitignore but still tracked by git (was force-added)",
                     location=item.name,
-                    fix=f"git rm --cached {item.name} && git commit -m 'untrack {item.name}'",
+                    fix=f"Stop tracking {item.name} and add it to .gitignore.",
+                    action={"type": "untrack", "path": item.name},
                 ))
 
     return findings
+
+
+_ENV_GITIGNORE_LINES = [".env", ".env.*", "!.env.example", "!.env.sample"]
+
+
+def _git(repo_path: Path, args: list[str]) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            errors="replace",
+        )
+    except Exception as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "git failed").strip()
+    return True, (result.stdout or result.stderr).strip()
+
+
+def _append_gitignore_line(repo_path: Path, line: str) -> None:
+    path = repo_path / ".gitignore"
+    existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    if line in existing.splitlines():
+        return
+    prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{prefix}{line}\n")
+
+
+def _tracked_under(repo_path: Path, dir_name: str) -> list[str]:
+    raw = _run(["git", "ls-files"], repo_path)
+    tracked = []
+    for line in raw.splitlines():
+        if f"/{dir_name}/" in line or line.startswith(f"{dir_name}/"):
+            tracked.append(line)
+    return tracked
+
+
+def _infer_action(finding: LeakFinding) -> dict | None:
+    if finding.category == "tracked-env-file" and finding.location:
+        return {"type": "untrack", "path": finding.location}
+    if finding.category != "gitignore-gap":
+        return None
+    description = finding.description
+    if description.startswith("No .gitignore"):
+        return {"type": "gitignore_lines", "lines": list(_ENV_GITIGNORE_LINES), "stage": True}
+    if "does not exclude .env" in description:
+        return {"type": "gitignore_lines", "lines": list(_ENV_GITIGNORE_LINES), "stage": False}
+    for dir_name, _pattern, _reason in SHOULD_BE_IGNORED:
+        if description.startswith(f"{dir_name}/"):
+            return {"type": "untrack_dir", "dir": dir_name}
+    return None
+
+
+def apply_auto_fix(finding: LeakFinding, repo_path: Path) -> tuple[bool, str]:
+    """Apply a leak fix with argument lists. Repo names are never sent to a shell."""
+    repo = repo_path.resolve()
+    action = finding.action if isinstance(finding.action, dict) else _infer_action(finding)
+    if not action:
+        return False, "This finding is instructions only."
+    kind = action.get("type")
+    if kind == "untrack":
+        rel = action.get("path")
+        if not isinstance(rel, str) or contained_path(repo, rel) is None:
+            return False, "Path is outside the repository."
+        _append_gitignore_line(repo, rel)
+        ok, out = _git(repo, ["git", "rm", "--cached", "--", rel])
+        if not ok:
+            return False, out
+        return _git(repo, ["git", "commit", "-m", "stop tracking env file"])
+    if kind == "gitignore_lines":
+        lines = action.get("lines")
+        if not isinstance(lines, list) or not lines:
+            return False, "No gitignore lines to write."
+        for line in lines:
+            if not isinstance(line, str) or any(ch in line for ch in ("\n", "\r", "\x00")):
+                return False, "Refusing to write gitignore lines."
+            _append_gitignore_line(repo, line)
+        if action.get("stage"):
+            return _git(repo, ["git", "add", "--", ".gitignore"])
+        return True, "Updated .gitignore"
+    if kind == "untrack_dir":
+        dir_name = action.get("dir")
+        allowed = {name for name, _pattern, _reason in SHOULD_BE_IGNORED}
+        if dir_name not in allowed:
+            return False, "Unknown directory."
+        _append_gitignore_line(repo, f"{dir_name}/")
+        tracked = _tracked_under(repo, dir_name)
+        if not tracked:
+            return True, "Updated .gitignore"
+        for rel in tracked:
+            if contained_path(repo, rel) is None:
+                return False, "Path is outside the repository."
+        ok, out = _git(repo, ["git", "rm", "-r", "--cached", "--", *tracked])
+        if not ok:
+            return False, out
+        return _git(repo, ["git", "commit", "-m", "untrack build artifacts"])
+    return False, "This finding is instructions only."
 
 
 # ── Combined entry point ──────────────────────────────────────────────────────

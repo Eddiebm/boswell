@@ -6,11 +6,12 @@ Each check returns: {name, status, detail}
 
 import json
 import os
-import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Optional
+
+from .safety import assert_public_http_url, guarded_urlopen
 
 
 def _deployed_url(repo_path: Path, platform: str, project_name: str) -> Optional[str]:
@@ -42,34 +43,25 @@ def _deployed_url(repo_path: Path, platform: str, project_name: str) -> Optional
 
 
 def check_build(repo_path: Path) -> dict:
+    """Report whether a build script exists. Never execute it.
+
+    A repository's npm build script can run any command as the operator.
+    """
     pkg = repo_path / "package.json"
     if not pkg.exists():
         return {"name": "build", "status": "skip", "detail": "No package.json"}
 
     try:
         scripts = json.loads(pkg.read_text()).get("scripts", {})
-        if "build" not in scripts:
-            return {"name": "build", "status": "skip", "detail": "No build script in package.json"}
     except Exception:
         return {"name": "build", "status": "skip", "detail": "Could not parse package.json"}
-
-    try:
-        result = subprocess.run(
-            ["npm", "run", "build"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            return {"name": "build", "status": "pass", "detail": "Build passed"}
-        lines = (result.stderr or result.stdout or "").strip().splitlines()
-        tail = "\n".join(lines[-5:]) if lines else "unknown error"
-        return {"name": "build", "status": "fail", "detail": f"Build failed:\n{tail}"}
-    except subprocess.TimeoutExpired:
-        return {"name": "build", "status": "fail", "detail": "Build timed out after 120s"}
-    except FileNotFoundError:
-        return {"name": "build", "status": "skip", "detail": "npm not found"}
+    if "build" not in scripts:
+        return {"name": "build", "status": "skip", "detail": "No build script in package.json"}
+    return {
+        "name": "build",
+        "status": "skip",
+        "detail": "Boswell does not run npm build. A repository build script can run any command. Run the build yourself if you trust this repo.",
+    }
 
 
 def check_live(url: Optional[str]) -> dict:
@@ -77,13 +69,19 @@ def check_live(url: Optional[str]) -> dict:
         return {"name": "live", "status": "skip", "detail": "No deployed URL found"}
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Boswell/1.0 ship-check"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        assert_public_http_url(url)
+        with guarded_urlopen(url, timeout=10, headers={"User-Agent": "Boswell/1.0 ship-check"}) as r:
             code = r.status
+    except ValueError:
+        return {
+            "name": "live",
+            "status": "fail",
+            "detail": "Deployed URL must be a public http or https address",
+        }
     except urllib.error.HTTPError as e:
         code = e.code
-    except Exception as e:
-        return {"name": "live", "status": "fail", "detail": f"Could not reach {url}: {e}"}
+    except Exception:
+        return {"name": "live", "status": "fail", "detail": "Could not reach the deployed URL"}
 
     if code < 400:
         return {"name": "live", "status": "pass", "detail": f"HTTP {code} from {url}"}
@@ -201,14 +199,23 @@ def check_health_endpoint(url: Optional[str]) -> dict:
     if not url:
         return {"name": "health_endpoint", "status": "skip", "detail": "No deployed URL"}
 
+    try:
+        assert_public_http_url(url)
+    except ValueError:
+        return {
+            "name": "health_endpoint",
+            "status": "fail",
+            "detail": "Deployed URL must be a public http or https address",
+        }
+
     base = url.rstrip("/")
     for path in ["/api/health", "/api/ping", "/health", "/ping", "/_health"]:
         try:
-            req = urllib.request.Request(
+            with guarded_urlopen(
                 base + path,
+                timeout=8,
                 headers={"User-Agent": "Boswell/1.0 ship-check"},
-            )
-            with urllib.request.urlopen(req, timeout=8) as r:
+            ) as r:
                 # 200/204 = healthy; other 2xx/3xx = present but unusual
                 return {"name": "health_endpoint", "status": "pass", "detail": f"{path} → HTTP {r.status}"}
         except urllib.error.HTTPError as e:
@@ -228,18 +235,27 @@ def check_auth_endpoint(url: Optional[str]) -> dict:
     if not url:
         return {"name": "auth_endpoint", "status": "skip", "detail": "No deployed URL"}
 
+    try:
+        assert_public_http_url(url)
+    except ValueError:
+        return {
+            "name": "auth_endpoint",
+            "status": "fail",
+            "detail": "Deployed URL must be a public http or https address",
+        }
+
     base = url.rstrip("/")
     body = json.dumps({"email": "boswell-check@example.com", "password": "bogus"}).encode()
 
     for path in ["/api/auth/login", "/api/login", "/auth/login", "/login"]:
         try:
-            req = urllib.request.Request(
+            with guarded_urlopen(
                 base + path,
+                timeout=8,
                 data=body,
                 headers={"Content-Type": "application/json", "User-Agent": "Boswell/1.0 ship-check"},
                 method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=8) as r:
+            ) as r:
                 # 200 with bogus creds is unusual but not a server error
                 return {"name": "auth_endpoint", "status": "pass", "detail": f"{path} → HTTP {r.status} (auth responding)"}
         except urllib.error.HTTPError as e:
@@ -288,15 +304,11 @@ def run_ship_checks(
     repo_path: Path,
     platform: str,
     project_id: str,
-    skip_build: bool = True,
 ) -> list[dict]:
     url = _deployed_url(repo_path, platform, project_id)
 
     checks = []
-    if skip_build:
-        checks.append({"name": "build", "status": "skip", "detail": "Build check skipped (run npm run build manually)"})
-    else:
-        checks.append(check_build(repo_path))
+    checks.append(check_build(repo_path))
 
     checks.append(check_live(url))
     checks.append(check_deployment_health(platform, project_id))
